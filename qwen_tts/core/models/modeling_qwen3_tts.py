@@ -1632,6 +1632,85 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         sub_talker_loss = sub_talker_outputs.loss
         return sub_talker_logits, sub_talker_loss
 
+    @torch.no_grad()
+    def _fast_code_predict(
+        self, past_hidden, last_id_hidden,
+        do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
+    ):
+        """Lean CodePredictor — replaces HF GenerationMixin.generate().
+
+        Eliminates per-call overhead of StoppingCriteriaList, LogitsProcessorList,
+        GenerationConfig, and _update_model_kwargs for 31 tokens × ~200 steps.
+        """
+        cp = self.code_predictor
+        num_codes = self.config.num_code_groups - 1  # 31
+
+        # Prefill: project and run through CodePredictor's 5 layers
+        prefill_embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
+        prefill_embeds = cp.small_to_mtp_projection(prefill_embeds)
+
+        cache = DynamicCache()
+        cache_pos = torch.arange(
+            prefill_embeds.shape[1], device=prefill_embeds.device
+        )
+
+        outputs = cp.model(
+            input_ids=None,
+            inputs_embeds=prefill_embeds,
+            past_key_values=cache,
+            use_cache=True,
+            cache_position=cache_pos,
+        )
+
+        hidden = outputs.last_hidden_state
+        logits = cp.lm_head[0](hidden[:, -1:, :]).squeeze(1)
+
+        generated_tokens = []
+        for step in range(num_codes):
+            # ── Sampling (top-k + top-p) ──
+            if do_sample and temperature > 0:
+                scores = logits / temperature
+                if top_k > 0:
+                    top_k_val = min(top_k, scores.size(-1))
+                    kth = torch.topk(scores, top_k_val, dim=-1).values[:, -1:]
+                    scores = scores.masked_fill(scores < kth, float('-inf'))
+                if top_p < 1.0:
+                    ss, si = torch.sort(scores, descending=True, dim=-1)
+                    cp_sum = torch.cumsum(torch.softmax(ss, dim=-1), dim=-1)
+                    mask = (cp_sum - torch.softmax(ss, dim=-1)) >= top_p
+                    ss[mask] = float('-inf')
+                    scores.scatter_(1, si, ss)
+                next_token = torch.multinomial(
+                    torch.softmax(scores, dim=-1), num_samples=1
+                )
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+
+            generated_tokens.append(next_token)
+
+            if step >= num_codes - 1:
+                break
+
+            # Embed token → project → run through CodePredictor layers
+            next_embeds = cp.model.get_input_embeddings()[step](next_token)
+            next_embeds = cp.small_to_mtp_projection(next_embeds)
+
+            seq_len = cache.get_seq_length()
+            cache_pos = torch.tensor([seq_len], device=next_embeds.device)
+
+            outputs = cp.model(
+                input_ids=None,
+                inputs_embeds=next_embeds,
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=cache_pos,
+            )
+
+            hidden = outputs.last_hidden_state
+            logits = cp.lm_head[step + 1](hidden[:, -1:, :]).squeeze(1)
+
+        return torch.cat(generated_tokens, dim=-1)  # [batch, num_codes]
+
     @can_return_tuple
     def forward(
         self,
@@ -1668,20 +1747,19 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
+            # ── Fast CodePredictor: lean loop replacing HF generate() ───
+            # Eliminates GenerationMixin overhead for 31 tokens per step.
+            sequences = self._fast_code_predict(
+                past_hidden, last_id_hidden,
                 do_sample=subtalker_dosample,
-                top_p=subtalker_top_p,
                 top_k=subtalker_top_k,
+                top_p=subtalker_top_p,
                 temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
             )
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+            codec_ids = torch.cat((input_ids, sequences), dim=-1)
             codec_hiddens = torch.cat(
                 [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                + [self.code_predictor.get_input_embeddings()[i](sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
                 dim=1,
             )
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
